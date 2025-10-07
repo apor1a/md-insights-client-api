@@ -8,6 +8,7 @@ import ipaddress
 import json
 import logging
 import os
+import re
 from typing import Dict, Any, Optional, Union
 
 import requests
@@ -54,9 +55,10 @@ class ThreatStreamClient:
         except ValueError:
             return 'domain'
     
-    def get_or_create_indicator(self, ioc_value: str, 
+    def get_or_create_indicator(self, ioc_value: str,
                                 confidence: int = 50,
-                                severity: str = 'medium') -> Optional[int]:
+                                severity: str = 'medium',
+                                enrichment_data: Optional[Dict[str, Any]] = None) -> Optional[int]:
         """
         Get existing indicator or create new one.
         
@@ -68,75 +70,7 @@ class ThreatStreamClient:
         Returns:
             Indicator ID if successful, None otherwise
         """
-        # Search for existing indicator
-        try:
-            response = self.session.get(
-                f'{self.base_url}/intelligence/',
-                params={'value': ioc_value, 'limit': 1},
-                timeout=30
-            )
-            
-            # Log the raw response for debugging
-            logger.debug(f"API Response Status: {response.status_code}")
-            logger.debug(f"API Response Headers: {dict(response.headers)}")
-            logger.debug(f"API Response Body: {response.text[:1000]}")  # First 1000 chars
-            
-            # Check for authentication/authorization errors
-            if response.status_code == 401:
-                logger.error(
-                    f"Authentication failed (401). Please check your API credentials.\n"
-                    f"Using: {self.api_key.split(':')[0]}:*** with URL: {self.base_url}\n"
-                    f"Server response: {response.text}"
-                )
-                return None
-            elif response.status_code == 403:
-                logger.error(
-                    f"Authorization failed (403). Your API key may not have the required permissions.\n"
-                    f"Server response: {response.text}"
-                )
-                return None
-            elif response.status_code == 404:
-                logger.error(
-                    f"API endpoint not found (404). Check your API URL: {self.base_url}\n"
-                    f"Server response: {response.text}"
-                )
-                return None
-            
-            response.raise_for_status()
-            
-            # Check if response is JSON
-            content_type = response.headers.get('content-type', '')
-            if 'application/json' not in content_type:
-                logger.error(
-                    f"API returned non-JSON response (content-type: {content_type}).\n"
-                    f"This often indicates incorrect API URL or authentication issues.\n"
-                    f"Full response:\n{response.text}"
-                )
-                return None
-            
-            try:
-                data = response.json()
-            except json.JSONDecodeError as e:
-                logger.error(
-                    f"Failed to parse API response as JSON: {e}\n"
-                    f"Response status: {response.status_code}\n"
-                    f"Full response:\n{response.text}"
-                )
-                return None
-            
-            if data.get('objects'):
-                indicator_id = data['objects'][0]['id']
-                logger.info(f"Found existing indicator {indicator_id} for {ioc_value}")
-                return indicator_id
-        except requests.exceptions.RequestException as e:
-            logger.error(
-                f"Network error searching for indicator: {e}\n"
-                f"API URL: {self.base_url}\n"
-                f"Auth header: apikey {self.api_key.split(':')[0]}:***"
-            )
-            return None
-        
-        # Create new indicator
+        # Always create new indicator (do not check for existing indicator first)
         itype = self._get_indicator_type(ioc_value)
         
         # Map insights data to ThreatStream indicator types
@@ -146,20 +80,53 @@ class ThreatStreamClient:
             'domain': 'mal_domain'
         }
         
+        # Build tags from enrichment data so we can send enrichment in the initial create
+        tags = []
+        # Always add a marker tag
+        tags.append({'name': 'md-insights', 'tlp': self.tlp})
+
+        if enrichment_data:
+            # Reputation-based tags
+            rep = enrichment_data.get('reputation')
+            if rep:
+                if rep.get('score') is not None:
+                    tags.append({
+                        'name': f"md-insights-reputation-{rep.get('score')}",
+                        'tlp': self.tlp
+                    })
+
+                if rep.get('report', {}).get('inquest', {}).get('malicious'):
+                    tags.append({'name': 'md-insights-malicious', 'tlp': self.tlp})
+                    for source in rep.get('report', {}).get('inquest', {}).get('sources', []):
+                        tags.append({'name': f'md-insights-source-{source}', 'tlp': self.tlp})
+
+            # C2 tag
+            if enrichment_data.get('c2'):
+                c2_value = enrichment_data.get('c2')
+                if c2_value and c2_value != 'null':
+                    sanitized = c2_value.replace(' ', '_').replace('.', '')
+                    tags.append({'name': f'md-insights-c2-{sanitized}', 'tlp': self.tlp})
+
         body = {
-            'value': ioc_value,
-            'itype': itype_mapping.get(itype, itype),
+            #'value': ioc_value,
+            #'itype': itype_mapping.get(itype, itype),
             'source': self.source_name,
             'classification': 'private',
             'confidence': confidence,
             'severity': severity,
             'status': 'active',
-            'tags': [{'name': 'md-insights'}]
+            'datatext': ioc_value,
+            'ip_mapping': 'mal_ip',
+            'domain_mapping': 'mal_domain',
+            'url_mapping': 'mal_url',
+            'email_mapping': 'mal_email',
+            'md5_mapping': 'mal_md5',
+            'tags': tags
         }
         
         try:
             response = self.session.post(
-                f'{self.base_url}',
+                f'{self.base_url}/intelligence/import/',
                 json=body,
                 timeout=30
             )
@@ -182,6 +149,42 @@ class ThreatStreamClient:
                     f"Server response: {response.text}"
                 )
                 return None
+            elif response.status_code == 409:
+                # Conflict - indicator likely already exists. Attempt to extract the existing ID.
+                try:
+                    conflict = response.json()
+                except json.JSONDecodeError:
+                    conflict = None
+
+                # Prefer direct id field
+                if conflict and conflict.get('id'):
+                    logger.info(f"Indicator already exists (409) with id {conflict.get('id')} for {ioc_value}")
+                    return conflict.get('id')
+
+                # Or objects list
+                if conflict and conflict.get('objects') and isinstance(conflict['objects'], list) and conflict['objects']:
+                    obj_id = conflict['objects'][0].get('id')
+                    if obj_id:
+                        logger.info(f"Indicator already exists (409) with id {obj_id} for {ioc_value}")
+                        return obj_id
+
+                # Try to extract ID from Location header if present
+                loc = response.headers.get('location') or response.headers.get('Location')
+                if loc:
+                    m = re.search(r"/(\d+)/?$", loc)
+                    if m:
+                        try:
+                            existing_id = int(m.group(1))
+                            logger.info(f"Indicator already exists (409) with id {existing_id} (from Location header) for {ioc_value}")
+                            return existing_id
+                        except ValueError:
+                            pass
+
+                logger.error(
+                    f"Conflict (409) when creating indicator, and could not determine existing id.\n"
+                    f"Response: {response.text}"
+                )
+                return None
             
             response.raise_for_status()
             
@@ -202,18 +205,30 @@ class ThreatStreamClient:
                     f"Full response:\n{response.text}"
                 )
                 return None
-            
+
+            # Accept multiple possible successful response shapes
+            # - import_session_id: asynchronous import
+            # - id: direct indicator id
+            # - objects: list containing created indicator
             if result.get('import_session_id'):
                 logger.info(f"Created import session {result['import_session_id']} for {ioc_value}")
-                # Note: In production, you'd want to poll for completion
-                # For now, we'll just return the session ID
                 return result.get('import_session_id')
-            else:
-                logger.error(
-                    f"Unexpected response format when creating indicator.\n"
-                    f"Response: {json.dumps(result, indent=2)}"
-                )
-                return None
+
+            if result.get('id'):
+                logger.info(f"Created indicator {result['id']} for {ioc_value}")
+                return result.get('id')
+
+            if result.get('objects') and isinstance(result['objects'], list) and result['objects']:
+                obj_id = result['objects'][0].get('id')
+                if obj_id:
+                    logger.info(f"Created indicator {obj_id} for {ioc_value}")
+                    return obj_id
+
+            logger.error(
+                f"Unexpected response format when creating indicator.\n"
+                f"Response: {json.dumps(result, indent=2)}"
+            )
+            return None
         except requests.exceptions.RequestException as e:
             logger.error(
                 f"Network error creating indicator: {e}\n"
@@ -221,76 +236,8 @@ class ThreatStreamClient:
                 f"Request body: {json.dumps(body, indent=2)}"
             )
             return None
-    
-    def add_enrichment(self, indicator_id: int, enrichment_data: Dict[str, Any]) -> bool:
-        """
-        Add enrichment data as tags/attributes to an indicator.
-        
-        Args:
-            indicator_id: ThreatStream indicator ID
-            enrichment_data: Dictionary of enrichment data
-            
-        Returns:
-            True if successful, False otherwise
-        """
-        tags = []
-        
-        # Process MD Insights enrichment data
-        if enrichment_data.get('reputation'):
-            rep = enrichment_data['reputation']
-            
-            # Add reputation score as tag
-            if rep.get('score'):
-                tags.append({
-                    'name': f"md-insights-reputation-{rep['score']}",
-                    'tlp': self.tlp
-                })
-            
-            # Process InQuest data
-            if rep.get('report', {}).get('inquest', {}).get('malicious'):
-                tags.append({
-                    'name': 'md-insights-malicious',
-                    'tlp': self.tlp
-                })
-                
-                # Add sources
-                for source in rep.get('report', {}).get('inquest', {}).get('sources', []):
-                    tags.append({
-                        'name': f'md-insights-source-{source}',
-                        'tlp': self.tlp
-                    })
-        
-        # Process C2 data
-        if enrichment_data.get('c2'):
-            c2_value = enrichment_data['c2']
-            if c2_value and c2_value != 'null':
-                tags.append({
-                    'name': f'md-insights-c2-{c2_value.replace(" ", "_").replace(".", "")}',
-                    'tlp': self.tlp
-                })
-        
-        if not tags:
-            logger.info("No enrichment data to add")
-            return True
-        
-        # Update indicator with tags
-        body = {
-            'tags': tags
-        }
-        
-        try:
-            response = self.session.patch(
-                f'{self.base_url}/intelligence/{indicator_id}/',
-                json=body,
-                timeout=30
-            )
-            response.raise_for_status()
-            logger.info(f"Added {len(tags)} enrichment tags to indicator {indicator_id}")
-            return True
-        except requests.exceptions.RequestException as e:
-            logger.error(f"Error adding enrichment: {e}")
-            return False
-
+    # The previous add_enrichment helper has been removed in favor of sending tags
+    # with the initial create call (see get_or_create_indicator(enrichment_data=...)).
 
 def process_insights_enrichment(insights_data: Dict[str, Any], 
                                threatstream_client: ThreatStreamClient) -> Dict[str, Any]:
@@ -347,32 +294,22 @@ def process_insights_enrichment(insights_data: Dict[str, Any],
             confidence = max(confidence, 85)
             severity = 'high'
         
-        # Get or create indicator in ThreatStream
+        # Get or create indicator in ThreatStream and include enrichment tags in the initial create
         indicator_id = threatstream_client.get_or_create_indicator(
-            ioc_value, 
+            ioc_value,
             confidence=confidence,
-            severity=severity
+            severity=severity,
+            enrichment_data=ioc_data
         )
-        
+
         if indicator_id:
-            # Add enrichment data
-            success = threatstream_client.add_enrichment(indicator_id, ioc_data)
-            
-            if success:
-                results['enriched'] += 1
-                results['details'].append({
-                    'ioc': ioc_value,
-                    'indicator_id': indicator_id,
-                    'status': 'enriched'
-                })
-                logger.info(f"Successfully enriched {ioc_value} (ID: {indicator_id})")
-            else:
-                results['errors'] += 1
-                results['details'].append({
-                    'ioc': ioc_value,
-                    'indicator_id': indicator_id,
-                    'status': 'enrichment_failed'
-                })
+            results['enriched'] += 1
+            results['details'].append({
+                'ioc': ioc_value,
+                'indicator_id': indicator_id,
+                'status': 'enriched'
+            })
+            logger.info(f"Successfully created/enriched {ioc_value} (ID: {indicator_id})")
         else:
             results['errors'] += 1
             results['details'].append({
