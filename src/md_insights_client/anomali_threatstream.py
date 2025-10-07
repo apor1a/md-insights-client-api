@@ -154,12 +154,12 @@ class ThreatStreamClient:
             'confidence': confidence,
             'severity': severity,
             'status': 'active',
-            'tags': [{'name': 'md-insights', 'tlp': self.tlp}]
+            'tags': [{'name': 'md-insights'}]
         }
         
         try:
             response = self.session.post(
-                f'{self.base_url}/intelligence/import/',
+                f'{self.base_url}',
                 json=body,
                 timeout=30
             )
